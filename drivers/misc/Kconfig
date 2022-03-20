@@ -519,6 +519,7 @@ config PERF_HELPER
 config GPIO_TESTING_MODE
 	tristate "A simple GPIO testing mode driver for sar controler"
 	default n
+	depends on MI_HARDWARE_ID
 	help
 	  Enable driver for a simple testing mode detection
 
