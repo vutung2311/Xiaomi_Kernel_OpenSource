@@ -190,6 +190,8 @@ int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 			uint8_t rxport, uint8_t nchan)
 {
 	int ret, i;
+	int chipset_ver = 0;
+
 	if (!btfmslim || !ch)
 		return -EINVAL;
 
@@ -244,7 +246,19 @@ int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 
 	if (btfm_num_ports_open > 0)
 		btfm_num_ports_open--;
+
 	BTFMSLIM_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
+
+	chipset_ver = btpower_get_chipset_version();
+
+	if (btfm_num_ports_open == 0 && (chipset_ver == QCA_HSP_SOC_ID_0200 ||
+		chipset_ver == QCA_HSP_SOC_ID_0210 ||
+		chipset_ver == QCA_HSP_SOC_ID_1201 ||
+		chipset_ver == QCA_HSP_SOC_ID_1211)) {
+		BTFMSLIM_INFO("SB reset needed after all ports disabled, sleeping");
+		msleep(DELAY_FOR_PORT_OPEN_MS);
+	}
+
 	return ret;
 }
 

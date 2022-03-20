@@ -256,9 +256,9 @@ void *qcom_dma_common_contiguous_remap(struct page *page, size_t size,
 }
 
 /*
-* Unmaps a range previously mapped by dma_common_contiguous_remap or
-* dma_common_pages_remap. Note that dma_common_contiguous_remap does
-* not insert an rb_tree entry since there is no pages array to save.
+ * Unmaps a range previously mapped by dma_common_contiguous_remap or
+ * dma_common_pages_remap. Note that dma_common_contiguous_remap does
+ * not insert an rb_tree entry since there is no pages array to save.
  */
 void qcom_dma_common_free_remap(void *cpu_addr, size_t size)
 {

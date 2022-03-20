@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2010-2011, 2019-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (C) 2021 XiaoMi, Inc. */
+/*
+ * Copyright (c) 2010-2011, 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <linux/of.h>
 #include <linux/module.h>
@@ -97,7 +100,25 @@ static int pm8xxx_rtc_read_rtc_data(struct pm8xxx_rtc *rtc_dd, unsigned long *rt
 	}
 
 	*rtc_data = value[0] | (value[1] << 8) | (value[2] << 16) |
-				((unsigned long)value[3] << 24);
+			((unsigned long)value[3] << 24);
+
+	return 0;
+}
+
+static int pm8xxx_rtc_read_alarm_data(struct pm8xxx_rtc *rtc_dd, unsigned long *alarm_data)
+{
+	int rc;
+	u8 value[NUM_8_BIT_RTC_REGS];
+
+	rc = regmap_bulk_read(rtc_dd->regmap, rtc_dd->regs->alarm_rw, value,
+			      sizeof(value));
+	if (rc) {
+		dev_err(rtc_dd->rtc_dev, "RTC read alarm data failed\n");
+		return rc;
+	}
+
+	*alarm_data = value[0] | (value[1] << 8) | (value[2] << 16) |
+			((unsigned long)value[3] << 24);
 
 	return 0;
 }
@@ -218,7 +239,7 @@ static int pm8xxx_rtc_read_time(struct device *dev, struct rtc_time *tm)
 
 	rc = pm8xxx_rtc_read_rtc_data(rtc_dd, &secs);
 	if (rc) {
-		dev_err(rtc_dd->rtc_dev, "RTC read time failed\n");
+		dev_err(dev, "RTC read time failed\n");
 		return rc;
 	}
 
@@ -280,20 +301,15 @@ static int pm8xxx_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 {
 	int rc;
 	unsigned int ctrl_reg;
-	u8 value[NUM_8_BIT_RTC_REGS];
 	unsigned long secs;
 	struct pm8xxx_rtc *rtc_dd = dev_get_drvdata(dev);
 	const struct pm8xxx_rtc_regs *regs = rtc_dd->regs;
 
-	rc = regmap_bulk_read(rtc_dd->regmap, regs->alarm_rw, value,
-			      sizeof(value));
+	rc = pm8xxx_rtc_read_alarm_data(rtc_dd, &secs);
 	if (rc) {
-		dev_err(dev, "RTC alarm time read failed\n");
+		dev_err(dev, "RTC alarm data read failed\n");
 		return rc;
 	}
-
-	secs = value[0] | (value[1] << 8) | (value[2] << 16) |
-	       ((unsigned long)value[3] << 24);
 
 	rtc_time64_to_tm(secs, &alarm->time);
 
@@ -409,24 +425,6 @@ rtc_alarm_handled:
 	return IRQ_HANDLED;
 }
 
-static int pm8xxx_rtc_read_alarm_data(struct pm8xxx_rtc *rtc_dd, unsigned long *alarm_data)
-{
-	int rc;
-	u8 value[NUM_8_BIT_RTC_REGS];
-
-	rc = regmap_bulk_read(rtc_dd->regmap, rtc_dd->regs->alarm_rw, value,
-			      sizeof(value));
-	if (rc) {
-		dev_err(rtc_dd->rtc_dev, "RTC read alarm data failed\n");
-		return rc;
-	}
-
-	*alarm_data = value[0] | (value[1] << 8) | (value[2] << 16) |
-				  ((unsigned long)value[3] << 24);
-
-	return 0;
-}
-
 /*
  * Trigger the alarm event and clear the alarm settings
  * if the alarm data has been behind the RTC data which
@@ -445,15 +443,14 @@ static int pm8xxx_rtc_init_alarm(struct pm8xxx_rtc *rtc_dd)
 	rc = pm8xxx_rtc_read_rtc_data(rtc_dd, &rtc_data);
 	if (rc) {
 		spin_unlock_irqrestore(&rtc_dd->ctrl_reg_lock, irq_flags);
-		dev_err(rtc_dd->rtc_dev,
-			"rtc read data read failed\n");
+		dev_err(rtc_dd->rtc_dev, "rtc read rtc data failed\n");
 		return rc;
 	}
 
 	rc = pm8xxx_rtc_read_alarm_data(rtc_dd, &alarm_data);
 	if (rc) {
 		spin_unlock_irqrestore(&rtc_dd->ctrl_reg_lock, irq_flags);
-		dev_err(rtc_dd->rtc_dev,"rtc read alarm data read failed\n");
+		dev_err(rtc_dd->rtc_dev, "rtc read alarm data failed\n");
 		return rc;
 	}
 

@@ -77,6 +77,7 @@ int read_cold_reset_rsp(struct nfc_dev *nfc_dev, char *header)
 		 * if response's OID doesn't match with the CMD's OID
 		 */
 		if (!(rsp_buf[0] & NCI_RSP_PKT_TYPE) ||
+			(!cold_rst->cmd_buf) ||
 			(rsp_buf[1] != cold_rst->cmd_buf[1])) {
 
 			dev_err(nfc_dev->nfc_device,
@@ -140,6 +141,7 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 {
 	int ret;
 	struct ese_ioctl_arg ioctl_arg;
+	struct ese_cold_reset_arg *cold_reset_arg = NULL;
 
 	if (!arg) {
 		dev_err(nfc_dev->nfc_device, "arg is invalid\n");
@@ -154,12 +156,11 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 		return -EFAULT;
 	}
 
-	nfc_dev->cold_reset.arg = kzalloc(sizeof(struct ese_cold_reset_arg),
-							GFP_KERNEL);
-	if (!nfc_dev->cold_reset.arg)
+	cold_reset_arg = kzalloc(sizeof(struct ese_cold_reset_arg), GFP_KERNEL);
+	if (!cold_reset_arg)
 		return -ENOMEM;
 
-	ret = copy_struct_from_user(nfc_dev->cold_reset.arg,
+	ret = copy_struct_from_user(cold_reset_arg,
 				sizeof(struct ese_cold_reset_arg),
 				u64_to_user_ptr(ioctl_arg.buf),
 				sizeof(struct ese_cold_reset_arg));
@@ -171,7 +172,7 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 		goto err;
 	}
 
-	switch (nfc_dev->cold_reset.arg->sub_cmd) {
+	switch (cold_reset_arg->sub_cmd) {
 
 	case ESE_COLD_RESET_DO:
 
@@ -180,11 +181,11 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 		 * source is same as the one which enabled protection.
 		 */
 		if (nfc_dev->cold_reset.is_crp_en &&
-			(nfc_dev->cold_reset.arg->src !=
+			(cold_reset_arg->src !=
 				nfc_dev->cold_reset.last_src_ese_prot)) {
 			dev_err(nfc_dev->nfc_device,
 				"cold reset from %d denied, protection is on\n",
-						nfc_dev->cold_reset.arg->src);
+				cold_reset_arg->src);
 			ret = -EACCES;
 			goto err;
 		}
@@ -207,7 +208,7 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 	case ESE_COLD_RESET_PROTECT_EN:
 
 		if (nfc_dev->cold_reset.is_crp_en) {
-			if (nfc_dev->cold_reset.arg->src !=
+			if (cold_reset_arg->src !=
 				nfc_dev->cold_reset.last_src_ese_prot) {
 				dev_err(nfc_dev->nfc_device,
 					"ese protection enable denied\n");
@@ -224,7 +225,7 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 	case ESE_COLD_RESET_PROTECT_DIS:
 
 		if (nfc_dev->cold_reset.is_crp_en &&
-			nfc_dev->cold_reset.arg->src !=
+			cold_reset_arg->src !=
 				nfc_dev->cold_reset.last_src_ese_prot) {
 			pr_err("ese cold reset protection disable denied\n");
 			ret = -EACCES;
@@ -243,8 +244,7 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 		nfc_dev->cold_reset.cmd_len = NCI_HDR_LEN +
 						COLD_RESET_PROT_CMD_PL_LEN;
 		nfc_dev->cold_reset.rsp_len = COLD_RESET_PROT_RSP_LEN;
-		if (nfc_dev->cold_reset.arg->sub_cmd ==
-						ESE_COLD_RESET_PROTECT_EN)
+		if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_EN)
 			nfc_dev->cold_reset.cmd_buf[3] = 0x1;
 		else
 			nfc_dev->cold_reset.cmd_buf[3] = 0x0;
@@ -253,12 +253,12 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 
 	default:
 		pr_err("%s invalid ese ioctl sub cmd %d\n", __func__,
-					nfc_dev->cold_reset.arg->sub_cmd);
+					cold_reset_arg->sub_cmd);
 		ret = -ENOIOCTLCMD;
 		goto err;
 	}
 
-	pr_info("nfc ese cmd hdr 0x%x 0x%x 0x%x\n",
+	pr_debug("nfc ese cmd hdr 0x%x 0x%x 0x%x\n",
 				nfc_dev->cold_reset.cmd_buf[0],
 				nfc_dev->cold_reset.cmd_buf[1],
 				nfc_dev->cold_reset.cmd_buf[2]);
@@ -314,23 +314,21 @@ int ese_cold_reset_ioctl(struct nfc_dev *nfc_dev, unsigned long arg)
 		nfc_dev->nfc_disable_intr(nfc_dev);
 	}
 
-	if (nfc_dev->cold_reset.arg->sub_cmd == ESE_COLD_RESET_PROTECT_EN) {
+	if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_EN) {
 		nfc_dev->cold_reset.is_crp_en = true;
-		nfc_dev->cold_reset.last_src_ese_prot =
-						nfc_dev->cold_reset.arg->src;
-	} else if (nfc_dev->cold_reset.arg->sub_cmd ==
-						ESE_COLD_RESET_PROTECT_DIS) {
+		nfc_dev->cold_reset.last_src_ese_prot = cold_reset_arg->src;
+	} else if (cold_reset_arg->sub_cmd == ESE_COLD_RESET_PROTECT_DIS) {
 		nfc_dev->cold_reset.is_crp_en = false;
 		nfc_dev->cold_reset.last_src_ese_prot =
 						ESE_COLD_RESET_ORIGIN_NONE;
 	} else
-		pr_info("ese cmd is %d\n", nfc_dev->cold_reset.arg->sub_cmd);
+		pr_debug("ese cmd is %d\n", cold_reset_arg->sub_cmd);
 
 	ret = nfc_dev->cold_reset.status;
 err:
 	kfree(nfc_dev->cold_reset.cmd_buf);
-	kfree(nfc_dev->cold_reset.arg);
-	nfc_dev->cold_reset.arg = NULL;
+	kfree(cold_reset_arg);
+	cold_reset_arg = NULL;
 	nfc_dev->cold_reset.cmd_buf = NULL;
 
 	return ret;

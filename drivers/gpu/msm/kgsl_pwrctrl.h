@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #ifndef __KGSL_PWRCTRL_H
 #define __KGSL_PWRCTRL_H
@@ -163,6 +164,8 @@ struct kgsl_pwrctrl {
 	u64 time_in_pwrlevel[KGSL_MAX_PWRLEVELS];
 	/** @last_stat_updated: The last time stats were updated */
 	ktime_t last_stat_updated;
+	/** @nb_max: Notifier block for DEV_PM_QOS_MAX_FREQUENCY */
+	struct notifier_block nb_max;
 };
 
 int kgsl_pwrctrl_init(struct kgsl_device *device);
@@ -216,7 +219,6 @@ void kgsl_pwrctrl_busy_time(struct kgsl_device *device, u64 time, u64 busy);
 void kgsl_pwrctrl_set_constraint(struct kgsl_device *device,
 			struct kgsl_pwr_constraint *pwrc, u32 id, u32 ts);
 int kgsl_pwrctrl_set_default_gpu_pwrlevel(struct kgsl_device *device);
-void kgsl_pwrctrl_update_thermal_pwrlevel(struct kgsl_device *device);
 
 /**
  * kgsl_pwrctrl_request_state - Request a specific power state
@@ -224,6 +226,13 @@ void kgsl_pwrctrl_update_thermal_pwrlevel(struct kgsl_device *device);
  * @state: Power state requested
  */
 void kgsl_pwrctrl_request_state(struct kgsl_device *device, u32 state);
+
+/**
+ * kgsl_pwrctrl_set_state - Set a specific power state
+ * @device: Pointer to the kgsl device
+ * @state: Power state requested
+ */
+void kgsl_pwrctrl_set_state(struct kgsl_device *device, u32 state);
 
 /**
  * kgsl_pwrctrl_axi - Propagate bus votes during slumber entry and exit

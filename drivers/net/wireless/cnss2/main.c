@@ -48,6 +48,7 @@
 #endif
 #define CNSS_BDF_TYPE_DEFAULT		CNSS_BDF_ELF
 #define CNSS_TIME_SYNC_PERIOD_DEFAULT	900000
+#define CNSS_MIN_TIME_SYNC_PERIOD	2000
 #define CNSS_DMS_QMI_CONNECTION_WAIT_MS 50
 #define CNSS_DMS_QMI_CONNECTION_WAIT_RETRY 200
 #define CNSS_DAEMON_CONNECT_TIMEOUT_MS  30000
@@ -542,7 +543,7 @@ static int cnss_setup_dms_mac(struct cnss_plat_data *plat_priv)
 		if (cfg) {
 			if (!cfg->dms_mac_addr_supported) {
 				cnss_pr_err("DMS MAC address not supported\n");
-				//CNSS_ASSERT(0);
+				CNSS_ASSERT(0);
 				return -EINVAL;
 			}
 		}
@@ -555,9 +556,9 @@ static int cnss_setup_dms_mac(struct cnss_plat_data *plat_priv)
 				break;
 			msleep(CNSS_DMS_QMI_CONNECTION_WAIT_MS);
 		}
-		if (!plat_priv->dms.nv_mac_not_prov && !plat_priv->dms.mac_valid) {
+		if (!plat_priv->dms.mac_valid) {
 			cnss_pr_err("Unable to get MAC from DMS after retries\n");
-			//CNSS_ASSERT(0);
+			CNSS_ASSERT(0);
 			return -EINVAL;
 		}
 	}
@@ -1374,20 +1375,6 @@ static const char *cnss_recovery_reason_to_str(enum cnss_recovery_reason reason)
 	return "UNKNOWN";
 };
 
-#ifdef CONFIG_CNSS2_DEBUG
-static bool cnss_link_down_self_recovery(void)
-{
-	/* Attempt self recovery only in production builds */
-	return false;
-}
-#else
-static bool cnss_link_down_self_recovery(void)
-{
-	cnss_pr_warn("PCI link down recovery failed. Force self recovery\n");
-	return true;
-}
-#endif
-
 static int cnss_do_recovery(struct cnss_plat_data *plat_priv,
 			    enum cnss_recovery_reason reason)
 {
@@ -1426,9 +1413,6 @@ static int cnss_do_recovery(struct cnss_plat_data *plat_priv,
 			clear_bit(CNSS_DRIVER_RECOVERY,
 				  &plat_priv->driver_state);
 			return 0;
-		} else {
-			if (cnss_link_down_self_recovery())
-				goto self_recovery;
 		}
 		break;
 	case CNSS_REASON_RDDM:
@@ -1700,7 +1684,7 @@ EXPORT_SYMBOL(cnss_qmi_send);
 static int cnss_cold_boot_cal_start_hdlr(struct cnss_plat_data *plat_priv)
 {
 	int ret = 0;
-	u32 retry = 0;
+	u32 retry = 0, timeout;
 
 	if (test_bit(CNSS_COLD_BOOT_CAL_DONE, &plat_priv->driver_state)) {
 		cnss_pr_dbg("Calibration complete. Ignore calibration req\n");
@@ -1732,6 +1716,15 @@ static int cnss_cold_boot_cal_start_hdlr(struct cnss_plat_data *plat_priv)
 	}
 
 	set_bit(CNSS_IN_COLD_BOOT_CAL, &plat_priv->driver_state);
+	if (test_bit(CNSS_DRIVER_REGISTER, &plat_priv->driver_state)) {
+		timeout = cnss_get_timeout(plat_priv,
+					   CNSS_TIMEOUT_CALIBRATION);
+		cnss_pr_dbg("Restarting calibration %ds timeout\n",
+			    timeout / 1000);
+		if (cancel_delayed_work_sync(&plat_priv->wlan_reg_driver_work))
+			schedule_delayed_work(&plat_priv->wlan_reg_driver_work,
+					      msecs_to_jiffies(timeout));
+	}
 	reinit_completion(&plat_priv->cal_complete);
 	ret = cnss_bus_dev_powerup(plat_priv);
 mark_cal_fail:
@@ -1785,12 +1778,13 @@ static int cnss_cold_boot_cal_done_hdlr(struct cnss_plat_data *plat_priv,
 
 	if (cal_info->cal_status == CNSS_CAL_DONE) {
 		cnss_cal_mem_upload_to_file(plat_priv);
-		if (cancel_delayed_work_sync(&plat_priv->wlan_reg_driver_work)
-		   ) {
-			cnss_pr_dbg("Schedule WLAN driver load\n");
+		if (!test_bit(CNSS_DRIVER_REGISTER, &plat_priv->driver_state))
+			goto out;
+
+		cnss_pr_dbg("Schedule WLAN driver load\n");
+		if (cancel_delayed_work_sync(&plat_priv->wlan_reg_driver_work))
 			schedule_delayed_work(&plat_priv->wlan_reg_driver_work,
 					      0);
-		}
 	}
 out:
 	kfree(data);
@@ -2535,7 +2529,7 @@ int cnss_register_ramdump(struct cnss_plat_data *plat_priv)
 	case QCA6290_DEVICE_ID:
 	case QCA6390_DEVICE_ID:
 	case QCA6490_DEVICE_ID:
-	case WCN7850_DEVICE_ID:
+	case KIWI_DEVICE_ID:
 		ret = cnss_register_ramdump_v2(plat_priv);
 		break;
 	default:
@@ -2555,7 +2549,7 @@ void cnss_unregister_ramdump(struct cnss_plat_data *plat_priv)
 	case QCA6290_DEVICE_ID:
 	case QCA6390_DEVICE_ID:
 	case QCA6490_DEVICE_ID:
-	case WCN7850_DEVICE_ID:
+	case KIWI_DEVICE_ID:
 		cnss_unregister_ramdump_v2(plat_priv);
 		break;
 	default:
@@ -2861,6 +2855,37 @@ static ssize_t enable_hds_store(struct device *dev,
 	return count;
 }
 
+static ssize_t time_sync_period_show(struct device *dev,
+				     struct device_attribute *attr,
+				     char *buf)
+{
+	struct cnss_plat_data *plat_priv = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u ms\n",
+			plat_priv->ctrl_params.time_sync_period);
+}
+
+static ssize_t time_sync_period_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct cnss_plat_data *plat_priv = dev_get_drvdata(dev);
+	unsigned int time_sync_period = 0;
+
+	if (!plat_priv)
+		return -ENODEV;
+
+	if (sscanf(buf, "%du", &time_sync_period) != 1) {
+		cnss_pr_err("Invalid time sync sysfs command\n");
+		return -EINVAL;
+	}
+
+	if (time_sync_period >= CNSS_MIN_TIME_SYNC_PERIOD)
+		cnss_bus_update_time_sync_period(plat_priv, time_sync_period);
+
+	return count;
+}
+
 static ssize_t recovery_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
@@ -2911,12 +2936,9 @@ static ssize_t fs_ready_store(struct device *dev,
 {
 	int fs_ready = 0;
 	struct cnss_plat_data *plat_priv = dev_get_drvdata(dev);
-	cnss_pr_err("fs_ready event!\n");
 
-	if (sscanf(buf, "%du", &fs_ready) != 1) {
-		cnss_pr_err("no parm to write to fs_ready!\n");
+	if (sscanf(buf, "%du", &fs_ready) != 1)
 		return -EINVAL;
-	}
 
 	cnss_pr_dbg("File system is ready, fs_ready is %d, count is %zu\n",
 		    fs_ready, count);
@@ -2931,13 +2953,11 @@ static ssize_t fs_ready_store(struct device *dev,
 		return count;
 	}
 
-	cnss_pr_dbg("device ID 0x%lx\n", plat_priv->device_id);
-
 	switch (plat_priv->device_id) {
 	case QCA6290_DEVICE_ID:
 	case QCA6390_DEVICE_ID:
 	case QCA6490_DEVICE_ID:
-	case WCN7850_DEVICE_ID:
+	case KIWI_DEVICE_ID:
 		break;
 	default:
 		cnss_pr_err("Not supported for device ID 0x%lx\n",
@@ -2945,11 +2965,10 @@ static ssize_t fs_ready_store(struct device *dev,
 		return count;
 	}
 
-	if (fs_ready == FILE_SYSTEM_READY && plat_priv->cbc_enabled) {
+	if (fs_ready == FILE_SYSTEM_READY && plat_priv->cbc_enabled)
 		cnss_driver_event_post(plat_priv,
 				       CNSS_DRIVER_EVENT_COLD_BOOT_CAL_START,
 				       0, NULL);
-	}
 
 	return count;
 }
@@ -3030,6 +3049,7 @@ static DEVICE_ATTR_WO(qdss_trace_stop);
 static DEVICE_ATTR_WO(qdss_conf_download);
 static DEVICE_ATTR_WO(hw_trace_override);
 static DEVICE_ATTR_WO(charger_mode);
+static DEVICE_ATTR_RW(time_sync_period);
 
 static struct attribute *cnss_attrs[] = {
 	&dev_attr_fs_ready.attr,
@@ -3041,6 +3061,7 @@ static struct attribute *cnss_attrs[] = {
 	&dev_attr_qdss_conf_download.attr,
 	&dev_attr_hw_trace_override.attr,
 	&dev_attr_charger_mode.attr,
+	&dev_attr_time_sync_period.attr,
 	NULL,
 };
 
@@ -3052,8 +3073,6 @@ static int cnss_create_sysfs_link(struct cnss_plat_data *plat_priv)
 {
 	struct device *dev = &plat_priv->plat_dev->dev;
 	int ret;
-
-	cnss_pr_err("start create cnss link\n");
 
 	ret = sysfs_create_link(kernel_kobj, &dev->kobj, "cnss");
 	if (ret) {
@@ -3261,7 +3280,7 @@ static const struct platform_device_id cnss_platform_id_table[] = {
 	{ .name = "qca6290", .driver_data = QCA6290_DEVICE_ID, },
 	{ .name = "qca6390", .driver_data = QCA6390_DEVICE_ID, },
 	{ .name = "qca6490", .driver_data = QCA6490_DEVICE_ID, },
-	{ .name = "wcn7850", .driver_data = WCN7850_DEVICE_ID, },
+	{ .name = "kiwi", .driver_data = KIWI_DEVICE_ID, },
 	{ },
 };
 
@@ -3279,7 +3298,7 @@ static const struct of_device_id cnss_of_match_table[] = {
 		.compatible = "qcom,cnss-qca6490",
 		.data = (void *)&cnss_platform_id_table[3]},
 	{
-		.compatible = "qcom,cnss-wcn7850",
+		.compatible = "qcom,cnss-kiwi",
 		.data = (void *)&cnss_platform_id_table[4]},
 	{ },
 };
@@ -3300,7 +3319,6 @@ static int cnss_probe(struct platform_device *plat_dev)
 	const struct platform_device_id *device_id;
 	int retry = 0;
 
-	cnss_pr_err("cnss_probe!\n");
 	if (cnss_get_plat_priv(plat_dev)) {
 		cnss_pr_err("Driver is already initialized!\n");
 		ret = -EEXIST;
@@ -3455,6 +3473,10 @@ static int cnss_remove(struct platform_device *plat_dev)
 	cnss_unregister_bus_scale(plat_priv);
 	cnss_unregister_esoc(plat_priv);
 	cnss_put_resources(plat_priv);
+
+	if (!IS_ERR_OR_NULL(plat_priv->mbox_chan))
+		mbox_free_channel(plat_priv->mbox_chan);
+
 	platform_set_drvdata(plat_dev, NULL);
 	plat_env = NULL;
 
@@ -3485,7 +3507,7 @@ static bool cnss_is_valid_dt_node_found(void)
 {
 	struct device_node *dn = NULL;
 
-	for_each_matching_node(dn, cnss_of_match_table) {
+	for_each_node_with_property(dn, "qcom,wlan") {
 		if (of_device_is_available(dn))
 			break;
 	}

@@ -124,6 +124,7 @@ static struct arm_smmu_option_prop arm_smmu_options[] = {
 	{ ARM_SMMU_OPT_3LVL_TABLES, "qcom,use-3-lvl-tables" },
 	{ ARM_SMMU_OPT_NO_ASID_RETENTION, "qcom,no-asid-retention" },
 	{ ARM_SMMU_OPT_DISABLE_ATOS, "qcom,disable-atos" },
+	{ ARM_SMMU_OPT_CONTEXT_FAULT_RETRY, "qcom,context-fault-retry" },
 	{ 0, NULL},
 };
 
@@ -150,7 +151,7 @@ static void __arm_smmu_qcom_tlb_sync(struct iommu_domain *domain);
 static inline int arm_smmu_rpm_get(struct arm_smmu_device *smmu)
 {
 	if (pm_runtime_enabled(smmu->dev))
-		return pm_runtime_get_sync(smmu->dev);
+		return pm_runtime_resume_and_get(smmu->dev);
 
 	return 0;
 }
@@ -304,13 +305,13 @@ static void arm_smmu_interrupt_selftest(struct arm_smmu_device *smmu)
 					msecs_to_jiffies(1000))) {
 			u32 fsr;
 
-			fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+			fsr = arm_smmu_cb_read(smmu, cb, ARM_SMMU_CB_FSR);
 			dev_info(smmu->dev, "timeout cb:%d, irq:%d, fsr:0x%x\n",
 				 cb, irq_cnt, fsr);
 
 			if (!fsr)
 				dev_err(smmu->dev, "SCTLR  = 0x%08x\n",
-					arm_smmu_cb_read(smmu, idx,
+					arm_smmu_cb_read(smmu, cb,
 							 ARM_SMMU_CB_SCTLR));
 		}
 
@@ -906,6 +907,50 @@ static int arm_smmu_get_fault_ids(struct iommu_domain *domain,
 	return 0;
 }
 
+#ifdef CONFIG_ARM_SMMU_CONTEXT_FAULT_RETRY
+/*
+ * Retry faulting address after tlb invalidate.
+ * Applicable to:  Waipio
+ */
+static irqreturn_t arm_smmu_context_fault_retry(struct arm_smmu_domain *smmu_domain)
+{
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	int idx = smmu_domain->cfg.cbndx;
+	u64 iova;
+	u32 fsr;
+
+	if (!(smmu->options & ARM_SMMU_OPT_CONTEXT_FAULT_RETRY) ||
+	    (test_bit(DOMAIN_ATTR_FAULT_MODEL_NO_STALL, smmu_domain->attributes)))
+		return IRQ_NONE;
+
+	iova = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_FAR);
+	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+
+	if (iova != smmu_domain->prev_fault_address ||
+			!smmu_domain->fault_retry_counter) {
+		smmu_domain->prev_fault_address = iova;
+		smmu_domain->fault_retry_counter++;
+		arm_smmu_tlb_inv_context_s1(smmu_domain);
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
+		/*
+		 * Barrier required to ensure that the FSR is cleared
+		 * before resuming SMMU operation
+		 */
+		wmb();
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
+					ARM_SMMU_RESUME_RESUME);
+		return IRQ_HANDLED;
+	}
+
+	return IRQ_NONE;
+}
+#else
+static irqreturn_t arm_smmu_context_fault_retry(struct arm_smmu_domain *smmu_domain)
+{
+	return IRQ_NONE;
+}
+#endif
+
 static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 {
 	u32 fsr;
@@ -934,6 +979,10 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 			"Took an address size fault.  Refusing to recover.\n");
 		BUG();
 	}
+
+	ret = arm_smmu_context_fault_retry(smmu_domain);
+	if (ret == IRQ_HANDLED)
+		goto out_power_off;
 
 	/*
 	 * If the fault helper returns -ENOSYS, then no client fault helper was
@@ -2353,9 +2402,14 @@ static int arm_smmu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	int ret;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
 
 	if (!ops)
 		return -ENODEV;
+
+	ret = arm_smmu_rpm_get(smmu);
+	if (ret < 0)
+		return ret;
 
 	gfp = arm_smmu_domain_gfp_flags(smmu_domain);
 	arm_smmu_secure_domain_lock(smmu_domain);
@@ -2368,6 +2422,7 @@ static int arm_smmu_map_pages(struct iommu_domain *domain, unsigned long iova,
 
 out:
 	arm_smmu_secure_domain_unlock(smmu_domain);
+	arm_smmu_rpm_put(smmu);
 	if (!ret)
 		trace_map_pages(smmu_domain, iova, pgsize, pgcount);
 
@@ -2381,9 +2436,14 @@ static int arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 	int ret;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
 
 	if (!ops)
 		return -ENODEV;
+
+	ret = arm_smmu_rpm_get(smmu);
+	if (ret < 0)
+		return ret;
 
 	gfp = arm_smmu_domain_gfp_flags(smmu_domain);
 	arm_smmu_secure_domain_lock(smmu_domain);
@@ -2396,6 +2456,7 @@ static int arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 
 out:
 	arm_smmu_secure_domain_unlock(smmu_domain);
+	arm_smmu_rpm_put(smmu);
 	if (!ret)
 		trace_map_sg(smmu_domain, iova, sg, nents);
 
@@ -2507,9 +2568,11 @@ static phys_addr_t __arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 	void __iomem *reg;
 	u32 tmp;
 	u64 phys;
-	unsigned long va;
-	int idx = cfg->cbndx;
+	unsigned long va, flags;
+	int idx  = cfg->cbndx;
+	phys_addr_t addr = 0;
 
+	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 	va = iova & ~0xfffUL;
 	if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
 		arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
@@ -2519,24 +2582,28 @@ static phys_addr_t __arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 	reg = arm_smmu_page(smmu, ARM_SMMU_CB(smmu, idx)) + ARM_SMMU_CB_ATSR;
 	if (readl_poll_timeout_atomic(reg,tmp,
 				      !(tmp & ARM_SMMU_ATSR_ACTIVE), 5, 50)) {
+		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 		phys = ops->iova_to_phys(ops, iova);
 		dev_err(dev,
-			"iova to phys timed out on %pad. software table walk result=%pa.\n",
-			&iova, &phys);
-		phys = 0;
-		return phys;
+
+			"iova to phys timed out on %pad. Falling back to software table walk.\n",
+			&iova);
+		arm_smmu_rpm_put(smmu);
+		return ops->iova_to_phys(ops, iova);
 	}
 
 	phys = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_PAR);
+	spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 	if (phys & ARM_SMMU_CB_PAR_F) {
 		dev_err(dev, "translation fault!\n");
 		dev_err(dev, "PAR = 0x%llx\n", phys);
-		phys = 0;
-	} else {
-		phys = (phys & (PHYS_MASK & ~0xfffULL)) | (iova & 0xfff);
+		goto out;
 	}
 
-	return phys;
+	addr = (phys & GENMASK_ULL(39, 12)) | (iova & 0xfff);
+out:
+
+	return addr;
 }
 
 static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
@@ -2544,12 +2611,25 @@ static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
 {
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	phys_addr_t phys;
 
 	if (domain->type == IOMMU_DOMAIN_IDENTITY)
 		return iova;
 
 	if (!ops)
 		return 0;
+
+	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_TRANS_OPS &&
+	    smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
+		if (arm_smmu_rpm_get(smmu) < 0)
+			return 0;
+		phys = __arm_smmu_iova_to_phys_hard(domain, iova);
+
+		arm_smmu_rpm_put(smmu);
+
+		return phys;
+	}
 
 	return ops->iova_to_phys(ops, iova);
 }
@@ -2563,7 +2643,7 @@ static phys_addr_t arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 				    struct qcom_iommu_atos_txn *txn)
 {
 	phys_addr_t ret = 0;
-	unsigned long flags;
+
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 
@@ -2578,12 +2658,10 @@ static phys_addr_t arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 		goto out;
 	}
 
-	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_TRANS_OPS &&
 			smmu_domain->stage == ARM_SMMU_DOMAIN_S1)
 		ret = __arm_smmu_iova_to_phys_hard(domain, txn->addr);
 
-	spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 
 out:
 	arm_smmu_rpm_put(smmu);
@@ -3482,7 +3560,7 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 
 	ret = of_property_read_u32(smmu->dev->of_node, "qcom,num-smr-override",
 		&num_mapping_groups_override);
-	if (!ret && size != num_mapping_groups_override) {
+	if (!ret && size > num_mapping_groups_override) {
 		dev_dbg(smmu->dev, "%d mapping groups overridden to %d\n",
 			size, num_mapping_groups_override);
 
@@ -3521,7 +3599,7 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 		"qcom,num-context-banks-override",
 		&num_context_banks_override);
 
-	if (!ret && smmu->num_context_banks != num_context_banks_override) {
+	if (!ret && smmu->num_context_banks > num_context_banks_override) {
 		dev_dbg(smmu->dev, "%d context banks overridden to %d\n",
 			smmu->num_context_banks,
 			num_context_banks_override);

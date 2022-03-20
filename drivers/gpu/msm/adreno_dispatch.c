@@ -737,6 +737,7 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 		(dispatch_q->inflight < inflight)) {
 		struct kgsl_drawobj *drawobj;
 		struct kgsl_drawobj_cmd *cmdobj;
+		struct kgsl_context *context;
 
 		if (adreno_gpu_fault(adreno_dev) != 0)
 			break;
@@ -762,6 +763,9 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 
 		timestamp = drawobj->timestamp;
 		cmdobj = CMDOBJ(drawobj);
+		context = drawobj->context;
+		trace_adreno_cmdbatch_ready(context->id, context->priority,
+			drawobj->timestamp, cmdobj->requeue_cnt);
 		ret = sendcmd(adreno_dev, cmdobj);
 
 		/*
@@ -782,6 +786,7 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 					drawctxt, cmdobj);
 				if (r)
 					ret = r;
+				cmdobj->requeue_cnt++;
 			}
 
 			break;
@@ -1087,8 +1092,8 @@ static inline bool _verify_ib(struct kgsl_device_private *dev_priv,
 	}
 
 	/* Make sure that the address is in range and dword aligned */
-	if (!kgsl_mmu_gpuaddr_in_range(private->pagetable, ib->gpuaddr) ||
-	    !IS_ALIGNED(ib->gpuaddr, 4)) {
+	if (!kgsl_mmu_gpuaddr_in_range(private->pagetable, ib->gpuaddr,
+		ib->size) || !IS_ALIGNED(ib->gpuaddr, 4)) {
 		pr_context(device, context, "ctxt %d invalid ib gpuaddr %llX\n",
 			context->id, ib->gpuaddr);
 		return false;
@@ -1598,7 +1603,7 @@ static void adreno_fault_header(struct kgsl_device *device,
 			drawobj ? ADRENO_CONTEXT(drawobj->context) : NULL;
 	unsigned int status, rptr, wptr, ib1sz, ib2sz;
 	uint64_t ib1base, ib2base;
-	bool gx_on = gmu_core_dev_gx_is_on(device);
+	bool gx_on = adreno_gx_is_on(adreno_dev);
 	int id = (rb != NULL) ? rb->id : -1;
 	const char *type = fault & ADRENO_GMU_FAULT ? "gmu" : "gpu";
 
@@ -2026,8 +2031,7 @@ static int dispatcher_do_fault(struct adreno_device *adreno_dev)
 			0xFFFFFFFF);
 	}
 
-	gx_on = gmu_core_dev_gx_is_on(device);
-
+	gx_on = adreno_gx_is_on(adreno_dev);
 
 	/*
 	 * On non-A3xx, read RBBM_STATUS3:SMMU_STALLED_ON_FAULT (BIT 24)
@@ -2282,6 +2286,8 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 	drawctxt->ticks_index = (drawctxt->ticks_index + 1) %
 		SUBMIT_RETIRE_TICKS_SIZE;
 
+	trace_adreno_cmdbatch_done(drawobj->context->id,
+		drawobj->context->priority, drawobj->timestamp);
 	kgsl_drawobj_destroy(drawobj);
 }
 

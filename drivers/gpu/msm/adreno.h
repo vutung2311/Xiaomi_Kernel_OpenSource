@@ -108,6 +108,9 @@
 #define ADRENO_BCL BIT(12)
 /* L3 voting is supported with L3 constraints */
 #define ADRENO_L3_VOTE BIT(13)
+/* Late Stage Reprojection (LSR) enablment for GMU */
+#define ADRENO_LSR BIT(15)
+
 
 /*
  * Adreno GPU quirks - control bits for various workarounds
@@ -199,6 +202,7 @@ enum adreno_gpurev {
 	 */
 	ADRENO_REV_GEN7_0_0 = 0x070000,
 	ADRENO_REV_GEN7_0_1 = 0x070001,
+	ADRENO_REV_GEN7_4_0 = 0x070400,
 };
 
 #define ADRENO_SOFT_FAULT BIT(0)
@@ -558,6 +562,8 @@ struct adreno_device {
 	bool sptp_pc_enabled;
 	/** @bcl_enabled: True if BCL is enabled */
 	bool bcl_enabled;
+	/** @lsr_enabled: True if LSR is enabled */
+	bool lsr_enabled;
 	struct kgsl_memdesc *profile_buffer;
 	unsigned int profile_index;
 	struct kgsl_memdesc *pwrup_reglist;
@@ -821,6 +827,10 @@ struct adreno_gpudev {
 	int (*setproperty)(struct kgsl_device_private *priv, u32 type,
 		void __user *value, u32 sizebytes);
 	int (*add_to_va_minidump)(struct adreno_device *adreno_dev);
+	/**
+	 * @gx_is_on - Return true if both gfx clock and gxgdsc are enabled.
+	 */
+	bool (*gx_is_on)(struct adreno_device *adreno_dev);
 };
 
 /**
@@ -932,6 +942,7 @@ void adreno_cx_misc_regrmw(struct adreno_device *adreno_dev,
 		unsigned int mask, unsigned int bits);
 void adreno_isense_regread(struct adreno_device *adreno_dev,
 		unsigned int offsetwords, unsigned int *value);
+bool adreno_gx_is_on(struct adreno_device *adreno_dev);
 
 /**
  * adreno_active_count_get - Wrapper for target specific active count get

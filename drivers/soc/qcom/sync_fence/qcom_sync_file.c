@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
  * Copyright (C) 2021 XiaoMi, Inc.
  */
@@ -210,13 +211,13 @@ static int spec_sync_create_array(struct fence_create_data *f)
 		ret = -EINVAL;
 		goto err;
 	}
-
 	node = kzalloc((sizeof(struct fence_array_node)), GFP_KERNEL);
 	if (!node) {
 		fput(sync_file->file);
 		ret = -ENOMEM;
 		goto err;
 	}
+
 	fd_install(fd, sync_file->file);
 	node->fence_array = fence_array;
 
@@ -276,6 +277,13 @@ static int spec_sync_bind_array(struct fence_bind_data *sync_bind_info)
 		ret = -EINVAL;
 		goto end;
 	}
+
+	if (fence_array->fences) {
+		pr_err("fence array already populated, spec fd:%d status:%d flags:0x%x\n",
+			sync_bind_info->out_bind_fd, dma_fence_get_status(fence), fence->flags);
+		goto end;
+	}
+
 	num_fences = fence_array->num_fences;
 	counter = num_fences;
 
@@ -298,11 +306,12 @@ static int spec_sync_bind_array(struct fence_bind_data *sync_bind_info)
 		goto out;
 	}
 
+	spin_lock(fence->lock);
 	fence_array->fences = fence_list;
 	for (i = 0; i < num_fences; i++) {
 		user_fence = sync_file_get_fence(user_fds[i]);
 		if (!user_fence) {
-			pr_err("bind fences are invalid !! user_fd:%d out_bind_fd:%d\n",
+			pr_warn("bind fences are invalid !! user_fd:%d out_bind_fd:%d\n",
 				user_fds[i], sync_bind_info->out_bind_fd);
 			counter = i;
 			ret = -EINVAL;
@@ -314,6 +323,8 @@ static int spec_sync_bind_array(struct fence_bind_data *sync_bind_info)
 	}
 
 	clear_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &fence->flags);
+	spin_unlock(fence->lock);
+
 	dma_fence_enable_sw_signaling(&fence_array->base);
 
 	clear_fence_array_tracker(false);
@@ -322,10 +333,12 @@ bind_invalid:
 	if (ret) {
 		for (i = counter - 1; i >= 0; i--)
 			dma_fence_put(fence_array->fences[i]);
+
 		kfree(fence_list);
 		fence_array->fences = NULL;
 		fence_array->num_fences = 0;
 		dma_fence_set_error(fence, -EINVAL);
+		spin_unlock(fence->lock);
 		dma_fence_signal(fence);
 		clear_fence_array_tracker(false);
 	}

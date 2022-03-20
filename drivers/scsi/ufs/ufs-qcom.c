@@ -14,6 +14,7 @@
 #include <linux/reset-controller.h>
 #include <linux/interconnect.h>
 #include <linux/phy/phy-qcom-ufs.h>
+#include <linux/clk/qcom.h>
 #include <linux/devfreq.h>
 #include <linux/cpu.h>
 #include <linux/blk-mq.h>
@@ -663,7 +664,15 @@ static int ufs_qcom_enable_hw_clk_gating(struct ufs_hba *hba)
 	if (err)
 		goto out;
 
-	err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
+	/*
+	 * As per HPG, ATTR_HW_CGC_EN bit should be enabled when operating at
+	 * more than 300mhz and hence should be disable in UFS init sequence
+	 */
+	if (host->ml_scale_up)
+		err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
+				PA_VS_CLK_CFG_REG_MASK1, PA_VS_CLK_CFG_REG);
+	else
+		err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_MASK,
 				PA_VS_CLK_CFG_REG_MASK, PA_VS_CLK_CFG_REG);
 	if (err)
 		goto out;
@@ -681,6 +690,36 @@ out:
 	return err;
 }
 
+static void ufs_qcom_force_mem_config(struct ufs_hba *hba)
+{
+	struct ufs_clk_info *clki;
+
+	/*
+	 * Configure the behavior of ufs clocks core and peripheral
+	 * memory state when they are turned off.
+	 * This configuration is required to allow retaining
+	 * ICE crypto configuration (including keys) when
+	 * core_clk_ice is turned off, and powering down
+	 * non-ICE RAMs of host controller.
+	 *
+	 * This is applicable only to gcc clocks.
+	 */
+	list_for_each_entry(clki, &hba->clk_list_head, list) {
+
+		/* skip it for non-gcc (rpmh) clocks */
+		if (!strcmp(clki->name, "ref_clk"))
+			continue;
+
+		if (!strcmp(clki->name, "core_clk_ice") ||
+			!strcmp(clki->name, "core_clk_ice_hw_ctl"))
+			qcom_clk_set_flags(clki->clk, CLKFLAG_RETAIN_MEM);
+		else
+			qcom_clk_set_flags(clki->clk, CLKFLAG_NORETAIN_MEM);
+		qcom_clk_set_flags(clki->clk, CLKFLAG_NORETAIN_PERIPH);
+		qcom_clk_set_flags(clki->clk, CLKFLAG_PERIPH_OFF_CLEAR);
+	}
+}
+
 static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
 				      enum ufs_notify_change_status status)
 {
@@ -689,6 +728,7 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
 
 	switch (status) {
 	case PRE_CHANGE:
+		ufs_qcom_force_mem_config(hba);
 		ufs_qcom_power_up_sequence(hba);
 		/*
 		 * The PHY PLL output is the source of tx/rx lane symbol
@@ -1030,6 +1070,7 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	struct phy *phy = host->generic_phy;
 	struct device *dev = hba->dev;
+	u32 temp;
 
 	switch (status) {
 	case PRE_CHANGE:
@@ -1057,6 +1098,17 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 		err = ufs_qcom_enable_hw_clk_gating(hba);
 		if (err)
 			goto out;
+
+		/*
+		 * Controller checks ICE configuration error without
+		 * checking if the command is SCSI command
+		 */
+		temp = readl_relaxed(host->dev_ref_clk_ctrl_mmio);
+		temp |= BIT(31);
+		writel_relaxed(temp, host->dev_ref_clk_ctrl_mmio);
+		/* ensure that UTP_SCASI_CHECK_DIS is enabled before link startup */
+		wmb();
+
 		/*
 		 * Some UFS devices (and may be host) have issues if LCC is
 		 * enabled. So we are setting PA_Local_TX_LCC_Enable to 0
@@ -1925,6 +1977,25 @@ static void ufshcd_parse_pm_levels(struct ufs_hba *hba)
 		ufshcd_is_valid_pm_lvl(spm_lvl))
 		hba->spm_lvl = spm_lvl;
 	host->is_dt_pm_level_read = true;
+}
+
+/*
+ * ufs_qcom_parse_multilevel_support - read from DTS where multi level
+ * clock scaling support is enabled
+ */
+static void ufs_qcom_parse_multilevel_clkscale_support(struct ufs_qcom_host *host)
+{
+	struct device_node *np = host->hba->dev->of_node;
+
+	if (!np)
+		return;
+
+	host->ml_scale_up = of_property_read_bool(np,
+			"multi-level-clk-scaling-support");
+
+	if (host->ml_scale_up)
+		dev_info(host->hba->dev, "(%s) Mullti level clock scale enabled\n",
+				 __func__);
 }
 
 static int ufs_qcom_apply_dev_quirks(struct ufs_hba *hba)
@@ -3047,6 +3118,7 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	ufs_qcom_parse_limits(host);
 	ufs_qcom_parse_g4_workaround_flag(host);
 	ufs_qcom_parse_lpm(host);
+	ufs_qcom_parse_multilevel_clkscale_support(host);
 	if (host->disable_lpm)
 		pm_runtime_forbid(host->hba->dev);
 
@@ -3615,6 +3687,49 @@ static void ufs_qcom_dump_dbg_regs(struct ufs_hba *hba)
 }
 
 /*
+ * Read sdam register for ufs device identification using
+ * nvmem interface and accordingly set phy submode.
+ * sdam Value = 0 : UFS 3.x, phy_submode = 1.
+ * sdam Value = 1 : UFS 2.x, phy_submode = 0.
+ */
+void ufs_qcom_read_nvmem_cell(struct ufs_qcom_host *host)
+{
+	size_t len;
+	u8 *data;
+	bool ufs_dev;
+
+	host->nvmem_cell = nvmem_cell_get(host->hba->dev, "ufs_dev");
+	if (IS_ERR(host->nvmem_cell)) {
+		dev_info(host->hba->dev, "(%s) Failed to get nvmem cell\n", __func__);
+		return;
+	}
+
+	data = (u8 *)nvmem_cell_read(host->nvmem_cell, &len);
+	if (IS_ERR(data)) {
+		dev_info(host->hba->dev, "(%s) Failed to read from nvmem\n", __func__);
+		goto cell_put;
+	}
+
+	ufs_dev = *data;
+	/* Revert as below
+	 * Value = 0 : UFS 3.x
+	 * Value = 1 : UFS 2.x
+	 */
+	host->limit_phy_submode = !ufs_dev;
+	if (host->limit_phy_submode)
+		dev_info(host->hba->dev, "(%s) UFS device is 3.x, phy_submode = %d\n",
+						__func__, host->limit_phy_submode);
+	else
+		dev_info(host->hba->dev, "(%s) UFS device is 2.x, phy_submode = %d\n",
+						__func__, host->limit_phy_submode);
+
+	kfree(data);
+
+cell_put:
+	nvmem_cell_put(host->nvmem_cell);
+}
+
+/*
  * ufs_qcom_parse_limits - read limits from DTS
  */
 static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
@@ -3630,6 +3745,7 @@ static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 	host->limit_rx_pwm_gear = UFS_QCOM_LIMIT_PWMGEAR_RX;
 	host->limit_rate = UFS_QCOM_LIMIT_HS_RATE;
 	host->limit_phy_submode = UFS_QCOM_LIMIT_PHY_SUBMODE;
+	host->ufs_dev_types = 0;
 
 	of_property_read_u32(np, "limit-tx-hs-gear", &host->limit_tx_hs_gear);
 	of_property_read_u32(np, "limit-rx-hs-gear", &host->limit_rx_hs_gear);
@@ -3637,6 +3753,10 @@ static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
 	of_property_read_u32(np, "limit-rx-pwm-gear", &host->limit_rx_pwm_gear);
 	of_property_read_u32(np, "limit-rate", &host->limit_rate);
 	of_property_read_u32(np, "limit-phy-submode", &host->limit_phy_submode);
+	of_property_read_u32(np, "ufs-dev-types", &host->ufs_dev_types);
+
+	if (host->ufs_dev_types >= 2)
+		ufs_qcom_read_nvmem_cell(host);
 }
 
 /*
@@ -3680,6 +3800,9 @@ static int ufs_qcom_device_reset(struct ufs_hba *hba)
 	if (!host->device_reset)
 		return -EOPNOTSUPP;
 
+	/* disable hba before device reset */
+	ufshcd_hba_stop(hba);
+
 	/*
 	 * The UFS device shall detect reset pulses of 1us, sleep for 10us to
 	 * be on the safe side.
@@ -3704,8 +3827,9 @@ static void ufs_qcom_config_scaling_param(struct ufs_hba *hba,
 
 	d = (struct devfreq_simple_ondemand_data *)data;
 	p->polling_ms = 60;
+	p->timer = DEVFREQ_TIMER_DELAYED;
 	d->upthreshold = 70;
-	d->downdifferential = 5;
+	d->downdifferential = 65;
 }
 
 static struct ufs_dev_fix ufs_qcom_dev_fixups[] = {

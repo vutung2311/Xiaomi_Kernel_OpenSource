@@ -745,6 +745,7 @@ int cnss_get_pinctrl(struct cnss_plat_data *plat_priv)
 				    ret);
 			goto out;
 		}
+		cnss_set_feature_list(plat_priv, CNSS_WLAN_EN_SUPPORT_V01);
 	}
 
 	/* Added for QCA6490 PMU delayed WLAN_EN_GPIO */
@@ -1119,12 +1120,6 @@ int cnss_aop_mbox_init(struct cnss_plat_data *plat_priv)
 	mbox->knows_txdone = false;
 
 	plat_priv->mbox_chan = NULL;
-	chan = mbox_request_channel(mbox, 0);
-	if (IS_ERR(chan)) {
-		cnss_pr_err("Failed to get mbox channel\n");
-		return PTR_ERR(chan);
-	}
-	plat_priv->mbox_chan = chan;
 
 	ret = of_property_read_string(plat_priv->plat_dev->dev.of_node,
 				      "qcom,vreg_ol_cpr",
@@ -1138,7 +1133,18 @@ int cnss_aop_mbox_init(struct cnss_plat_data *plat_priv)
 	if (ret)
 		cnss_pr_dbg("Volt regulator for Int Power Amp not configured\n");
 
+	if (!plat_priv->vreg_ol_cpr && !plat_priv->vreg_ipa)
+		return 0;
+
+	chan = mbox_request_channel(mbox, 0);
+	if (IS_ERR(chan)) {
+		cnss_pr_err("Failed to get mbox channel\n");
+		return PTR_ERR(chan);
+	}
+
+	plat_priv->mbox_chan = chan;
 	cnss_pr_dbg("Mbox channel initialized\n");
+
 	return 0;
 }
 

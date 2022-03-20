@@ -285,6 +285,9 @@ static void log_gpu_fault(struct adreno_device *adreno_dev)
 			cur, cur_rptr, cur_wptr, next, next_rptr, next_wptr);
 		}
 		break;
+	case GMU_CP_GPC_ERROR:
+		dev_crit_ratelimited(dev, "RBBM: GPC error\n");
+		break;
 	default:
 		dev_crit_ratelimited(dev, "Unknown GPU fault: %u\n",
 			cmd->error);
@@ -688,9 +691,16 @@ static struct hfi_mem_alloc_entry *get_mem_alloc_entry(
 		flags |= KGSL_MEMFLAGS_SECURE;
 
 	if (!(desc->flags & HFI_MEMFLAG_GFX_ACC)) {
-		entry->md = reserve_gmu_kernel_block(gmu, 0, desc->size,
-				(desc->flags & HFI_MEMFLAG_GMU_CACHEABLE) ?
-				GMU_CACHE : GMU_NONCACHED_KERNEL);
+		if (desc->mem_kind == HFI_MEMKIND_MMIO_IPC_CORE)
+			entry->md = reserve_gmu_kernel_block_fixed(gmu, 0, desc->size,
+					(desc->flags & HFI_MEMFLAG_GMU_CACHEABLE) ?
+					GMU_CACHE : GMU_NONCACHED_KERNEL,
+					"qcom,ipc-core", get_attrs(desc->flags));
+		else
+			entry->md = reserve_gmu_kernel_block(gmu, 0, desc->size,
+					(desc->flags & HFI_MEMFLAG_GMU_CACHEABLE) ?
+					GMU_CACHE : GMU_NONCACHED_KERNEL);
+
 		if (IS_ERR(entry->md)) {
 			int ret = PTR_ERR(entry->md);
 
@@ -970,6 +980,13 @@ int a6xx_hwsched_hfi_start(struct adreno_device *adreno_dev)
 			1, 0);
 	if (ret)
 		goto err;
+
+	if (adreno_dev->lsr_enabled) {
+		ret = a6xx_hfi_send_feature_ctrl(adreno_dev, HFI_FEATURE_LSR,
+				1, 0);
+		if (ret)
+			goto err;
+	}
 
 	/* Enable the long ib timeout detection */
 	if (adreno_long_ib_detect(adreno_dev)) {

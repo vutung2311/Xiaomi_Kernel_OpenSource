@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/clk/qcom.h>
+#include <linux/clk-provider.h>
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
@@ -50,6 +52,7 @@ static u32 a6xx_pwrup_reglist[] = {
 	A6XX_SP_NC_MODE_CNTL,
 	A6XX_PC_DBG_ECO_CNTL,
 	A6XX_RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE,
+	A6XX_UCHE_GBIF_GX_CONFIG,
 };
 
 /* IFPC only static powerup restore list */
@@ -93,8 +96,27 @@ static u32 a6xx_ifpc_pwrup_reglist[] = {
 };
 
 /* Applicable to a620, a635, a650 and a660 */
+static u32 a650_ifpc_pwrup_reglist[] = {
+	A6XX_CP_PROTECT_REG+32,
+	A6XX_CP_PROTECT_REG+33,
+	A6XX_CP_PROTECT_REG+34,
+	A6XX_CP_PROTECT_REG+35,
+	A6XX_CP_PROTECT_REG+36,
+	A6XX_CP_PROTECT_REG+37,
+	A6XX_CP_PROTECT_REG+38,
+	A6XX_CP_PROTECT_REG+39,
+	A6XX_CP_PROTECT_REG+40,
+	A6XX_CP_PROTECT_REG+41,
+	A6XX_CP_PROTECT_REG+42,
+	A6XX_CP_PROTECT_REG+43,
+	A6XX_CP_PROTECT_REG+44,
+	A6XX_CP_PROTECT_REG+45,
+	A6XX_CP_PROTECT_REG+46,
+	A6XX_CP_PROTECT_REG+47,
+};
+
+/* Applicable to a620, a635, a650 and a660 */
 static u32 a650_pwrup_reglist[] = {
-	A6XX_CP_PROTECT_REG + 47,          /* Programmed for infinite span */
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_0,
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_1,
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_2,
@@ -112,12 +134,14 @@ int a6xx_fenced_write(struct adreno_device *adreno_dev, u32 offset,
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	unsigned int status, i;
+	u64 ts1, ts2;
 
 	kgsl_regwrite(device, offset, value);
 
 	if (!gmu_core_isenabled(device))
 		return 0;
 
+	ts1 = a6xx_read_alwayson(adreno_dev);
 	for (i = 0; i < GMU_CORE_LONG_WAKEUP_RETRY_LIMIT; i++) {
 		/*
 		 * Make sure the previous register write is posted before
@@ -145,9 +169,10 @@ int a6xx_fenced_write(struct adreno_device *adreno_dev, u32 offset,
 		return 0;
 
 	if (i == GMU_CORE_LONG_WAKEUP_RETRY_LIMIT) {
+		ts2 = a6xx_read_alwayson(adreno_dev);
 		dev_err(adreno_dev->dev.dev,
-			"Timed out waiting %d usecs to write fenced register 0x%x\n",
-			i * GMU_CORE_WAKEUP_DELAY_US, offset);
+			"Timed out waiting %d usecs to write fenced register 0x%x, timestamps: %llx %llx\n",
+			i * GMU_CORE_WAKEUP_DELAY_US, offset, ts1, ts2);
 		return -ETIMEDOUT;
 	}
 
@@ -302,7 +327,12 @@ static unsigned int __get_gmu_wfi_config(struct adreno_device *adreno_dev)
 void a6xx_cx_regulator_disable_wait(struct regulator *reg,
 				struct kgsl_device *device, u32 timeout)
 {
-	if (!adreno_regulator_disable_poll(device, reg, A6XX_GPU_CC_CX_GDSCR, timeout)) {
+	u32 offset;
+
+	offset = adreno_is_a662(ADRENO_DEVICE(device)) ?
+			 A662_GPU_CC_CX_GDSCR : A6XX_GPU_CC_CX_GDSCR;
+
+	if (!adreno_regulator_disable_poll(device, reg, offset, timeout)) {
 		dev_err(device->dev, "GPU CX wait timeout. Dumping CX votes:\n");
 		/* Dump the cx regulator consumer list */
 		qcom_clk_dump(NULL, reg, false);
@@ -365,6 +395,10 @@ static void a6xx_hwcg_set(struct adreno_device *adreno_dev, bool on)
 		kgsl_regwrite(device, a6xx_core->hwcg[i].offset,
 			on ? a6xx_core->hwcg[i].val : 0);
 
+	/* GBIF L2 CGC control is not part of the UCHE */
+	kgsl_regrmw(device, A6XX_UCHE_GBIF_GX_CONFIG, 0x70000,
+			FIELD_PREP(GENMASK(18, 16), on ? 2 : 0));
+
 	/*
 	 * Enable SP clock after programming HWCG registers.
 	 * A612 and A610 GPU is not having the GX power domain.
@@ -392,14 +426,21 @@ struct a6xx_reglist_list {
 
 static void a6xx_patch_pwrup_reglist(struct adreno_device *adreno_dev)
 {
-	struct a6xx_reglist_list reglist[3];
+	struct a6xx_reglist_list reglist[4];
 	void *ptr = adreno_dev->pwrup_reglist->hostptr;
 	struct cpu_gpu_lock *lock = ptr;
 	int items = 0, i, j;
 	u32 *dest = ptr + sizeof(*lock);
+	u16 list_offset = 0;
 
 	/* Static IFPC-only registers */
-	reglist[items++] = REGLIST(a6xx_ifpc_pwrup_reglist);
+	reglist[items] = REGLIST(a6xx_ifpc_pwrup_reglist);
+	list_offset += reglist[items++].count * 2;
+
+	if (adreno_is_a650_family(adreno_dev)) {
+		reglist[items] = REGLIST(a650_ifpc_pwrup_reglist);
+		list_offset += reglist[items++].count * 2;
+	}
 
 	/* Static IFPC + preemption registers */
 	reglist[items++] = REGLIST(a6xx_pwrup_reglist);
@@ -452,7 +493,7 @@ static void a6xx_patch_pwrup_reglist(struct adreno_device *adreno_dev)
 	 * all the lists and list_offset should be specified as the size in
 	 * dwords of the first entry in the list.
 	 */
-	lock->list_offset = reglist[0].count * 2;
+	lock->list_offset = list_offset;
 }
 
 
@@ -469,11 +510,12 @@ static void a6xx_set_secvid(struct kgsl_device *device)
 
 	kgsl_regwrite(device, A6XX_RBBM_SECVID_TSB_CNTL, 0x0);
 	kgsl_regwrite(device, A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO,
-		lower_32_bits(KGSL_IOMMU_SECURE_BASE(&device->mmu)));
+		lower_32_bits(KGSL_IOMMU_SECURE_BASE32));
 	kgsl_regwrite(device, A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI,
-		upper_32_bits(KGSL_IOMMU_SECURE_BASE(&device->mmu)));
+		upper_32_bits(KGSL_IOMMU_SECURE_BASE32));
 	kgsl_regwrite(device, A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE,
-		KGSL_IOMMU_SECURE_SIZE(&device->mmu));
+		FIELD_PREP(GENMASK(31, 12),
+		(KGSL_IOMMU_SECURE_SIZE(&device->mmu) / SZ_4K)));
 
 	if (ADRENO_QUIRK(ADRENO_DEVICE(device), ADRENO_QUIRK_SECVID_SET_ONCE))
 		set = true;
@@ -489,6 +531,19 @@ static void a6xx_deassert_gbif_halt(struct adreno_device *adreno_dev)
 		kgsl_regwrite(device, A6XX_RBBM_GPR0_CNTL, 0x0);
 	else
 		kgsl_regwrite(device, A6XX_RBBM_GBIF_HALT, 0x0);
+}
+
+bool a6xx_gx_is_on(struct adreno_device *adreno_dev)
+{
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+	bool gdsc_on, clk_on;
+
+	clk_on = __clk_is_enabled(pwr->grp_clks[0]);
+
+	gdsc_on = regulator_is_enabled(pwr->gx_gdsc);
+
+	return (gdsc_on & clk_on);
 }
 
 /*
@@ -2629,6 +2684,7 @@ const struct adreno_gpudev adreno_a6xx_gpudev = {
 	.power_stats = a6xx_power_stats,
 	.setproperty = a6xx_setproperty,
 	.add_to_va_minidump = a6xx_dev_add_to_minidump,
+	.gx_is_on = a6xx_gx_is_on,
 };
 
 const struct a6xx_gpudev adreno_a6xx_hwsched_gpudev = {
@@ -2681,6 +2737,7 @@ const struct a6xx_gpudev adreno_a6xx_gmu_gpudev = {
 		.power_stats = a6xx_power_stats,
 		.setproperty = a6xx_setproperty,
 		.add_to_va_minidump = a6xx_gmu_add_to_minidump,
+		.gx_is_on = a6xx_gmu_gx_is_on,
 	},
 	.hfi_probe = a6xx_gmu_hfi_probe,
 	.handle_watchdog = a6xx_gmu_handle_watchdog,
@@ -2710,6 +2767,7 @@ const struct adreno_gpudev adreno_a6xx_rgmu_gpudev = {
 	.power_stats = a6xx_power_stats,
 	.setproperty = a6xx_setproperty,
 	.add_to_va_minidump = a6xx_rgmu_add_to_minidump,
+	.gx_is_on = a6xx_rgmu_gx_is_on,
 };
 
 /* This is a non GMU/RGMU part */
@@ -2745,6 +2803,7 @@ const struct adreno_gpudev adreno_a619_holi_gpudev = {
 	.power_stats = a6xx_power_stats,
 	.setproperty = a6xx_setproperty,
 	.add_to_va_minidump = a6xx_dev_add_to_minidump,
+	.gx_is_on = a619_holi_gx_is_on,
 };
 
 const struct a6xx_gpudev adreno_a630_gpudev = {
@@ -2772,6 +2831,7 @@ const struct a6xx_gpudev adreno_a630_gpudev = {
 		.power_stats = a6xx_power_stats,
 		.setproperty = a6xx_setproperty,
 		.add_to_va_minidump = a6xx_gmu_add_to_minidump,
+		.gx_is_on = a6xx_gmu_gx_is_on,
 	},
 	.hfi_probe = a6xx_gmu_hfi_probe,
 	.handle_watchdog = a6xx_gmu_handle_watchdog,

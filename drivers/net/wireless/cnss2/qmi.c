@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2015-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (C) 2021 XiaoMi, Inc. */
+/* Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <linux/module.h>
 #include <linux/soc/qcom/qmi.h>
@@ -53,7 +55,6 @@
 #define QMI_WLFW_MAX_RECV_BUF_SIZE	SZ_8K
 #define IMSPRIVATE_SERVICE_MAX_MSG_LEN	SZ_8K
 #define DMS_QMI_MAX_MSG_LEN		SZ_256
-#define DMS_MAC_NOT_PROVISIONED		16
 
 #define QMI_WLFW_MAC_READY_TIMEOUT_MS	50
 #define QMI_WLFW_MAC_READY_MAX_RETRY	200
@@ -194,7 +195,7 @@ qmi_registered:
 static void cnss_wlfw_host_cap_parse_mlo(struct cnss_plat_data *plat_priv,
 					 struct wlfw_host_cap_req_msg_v01 *req)
 {
-	if (plat_priv->device_id == WCN7850_DEVICE_ID) {
+	if (plat_priv->device_id == KIWI_DEVICE_ID) {
 		req->mlo_capable_valid = 1;
 		req->mlo_capable = 1;
 		req->mlo_chip_id_valid = 1;
@@ -549,6 +550,18 @@ int cnss_wlfw_tgt_cap_send_sync(struct cnss_plat_data *plat_priv)
 		plat_priv->fw_pcie_gen_switch =
 			!!(resp->fw_caps & QMI_WLFW_HOST_PCIE_GEN_SWITCH_V01);
 
+	if (resp->hang_data_length_valid &&
+	    resp->hang_data_length &&
+	    resp->hang_data_length <= WLFW_MAX_HANG_EVENT_DATA_SIZE)
+		plat_priv->hang_event_data_len = resp->hang_data_length;
+	else
+		plat_priv->hang_event_data_len = 0;
+
+	if (resp->hang_data_addr_offset_valid)
+		plat_priv->hang_data_addr_offset = resp->hang_data_addr_offset;
+	else
+		plat_priv->hang_data_addr_offset = 0;
+
 	cnss_pr_dbg("Target capability: chip_id: 0x%x, chip_family: 0x%x, board_id: 0x%x, soc_id: 0x%x, otp_version: 0x%x\n",
 		    plat_priv->chip_info.chip_id,
 		    plat_priv->chip_info.chip_family,
@@ -558,6 +571,9 @@ int cnss_wlfw_tgt_cap_send_sync(struct cnss_plat_data *plat_priv)
 		    plat_priv->fw_version_info.fw_version,
 		    plat_priv->fw_version_info.fw_build_timestamp,
 		    plat_priv->fw_build_id);
+	cnss_pr_dbg("Hang event params, Length: 0x%x, Offset Address: 0x%x\n",
+		    plat_priv->hang_event_data_len,
+		    plat_priv->hang_data_addr_offset);
 
 	kfree(req);
 	kfree(resp);
@@ -1075,7 +1091,7 @@ void cnss_get_qdss_cfg_filename(struct cnss_plat_data *plat_priv,
 	char filename_tmp[MAX_FIRMWARE_NAME_LEN];
 	char *debug_str = QDSS_DEBUG_FILE_STR;
 
-	if (plat_priv->device_id == WCN7850_DEVICE_ID)
+	if (plat_priv->device_id == KIWI_DEVICE_ID)
 		debug_str = "";
 
 	if (plat_priv->device_version.major_version == FW_V2_NUMBER)
@@ -2245,7 +2261,8 @@ static void cnss_wlfw_request_mem_ind_cb(struct qmi_handle *qmi_wlfw,
 			    ind_msg->mem_seg[i].size, ind_msg->mem_seg[i].type);
 		plat_priv->fw_mem[i].type = ind_msg->mem_seg[i].type;
 		plat_priv->fw_mem[i].size = ind_msg->mem_seg[i].size;
-		if (plat_priv->fw_mem[i].type == CNSS_MEM_TYPE_DDR)
+		if (!plat_priv->fw_mem[i].va &&
+		    plat_priv->fw_mem[i].type == CNSS_MEM_TYPE_DDR)
 			plat_priv->fw_mem[i].attrs |=
 				DMA_ATTR_FORCE_CONTIGUOUS;
 		if (plat_priv->fw_mem[i].type == CNSS_MEM_CAL_V01)
@@ -3020,15 +3037,9 @@ int cnss_qmi_get_dms_mac(struct cnss_plat_data *plat_priv)
 	}
 
 	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
-                if (resp.resp.error == DMS_MAC_NOT_PROVISIONED) {
-                        cnss_pr_err("NV MAC address is not provisioned");
-                        plat_priv->dms.nv_mac_not_prov = 1;
-                        ret = -resp.resp.result;
-                } else {
-                        cnss_pr_err("QMI_DMS_GET_MAC_ADDRESS_REQ_V01 failed, result: %d, err: %d\n",
-                                    resp.resp.result, resp.resp.error);
-                        ret = -EAGAIN;
-                }
+		cnss_pr_err("QMI_DMS_GET_MAC_ADDRESS_REQ_V01 failed, result: %d, err: %d\n",
+					resp.resp.result, resp.resp.error);
+		ret = -resp.resp.result;
 		goto out;
 	}
 	if (!resp.mac_address_valid ||
