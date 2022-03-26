@@ -1,3 +1,6 @@
+ifeq ($(MMRM_ROOT),)
+MMRM_ROOT=$(srctree)/techpack/mmrm-driver
+endif
 include $(MMRM_ROOT)/config/waipiommrm.conf
 LINUXINCLUDE += -include $(MMRM_ROOT)/config/waipiommrmconf.h
 
